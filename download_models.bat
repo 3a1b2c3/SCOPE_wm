@@ -1,13 +1,16 @@
 @echo off
 setlocal enableextensions enabledelayedexpansion
 
-REM Downloads the SCOPE model weights (~36 GB) into the HuggingFace cache.
-REM No --local-dir is used, so files live only in:
-REM   %USERPROFILE%\.cache\huggingface\hub\models--zizhaotong--SCOPE
-REM Re-run safely: huggingface_hub resumes partial downloads.
+REM Downloads SCOPE model weights (~36 GB) directly into ./SCOPE via
+REM huggingface_hub.snapshot_download(local_dir=...).  huggingface_hub >=0.23
+REM writes files straight into local_dir without going through the
+REM blobs/snapshots layout, so Windows symlink limitations no longer cause
+REM 2x disk usage.  Re-run safely: snapshot_download resumes partial files.
 
 set "REPO_ROOT=%~dp0"
 set "VENV_PY=%REPO_ROOT%.venv\Scripts\python.exe"
+set "TARGET_DIR=%REPO_ROOT%SCOPE"
+set "DL_SCRIPT=%REPO_ROOT%_download_models.py"
 
 if not exist "!VENV_PY!" (
     echo [download_models] ERROR: venv not found at !VENV_PY!
@@ -15,20 +18,23 @@ if not exist "!VENV_PY!" (
     exit /b 1
 )
 
-echo [download_models] Downloading zizhaotong/SCOPE into HF cache...
-REM Use snapshot_download directly (not the CLI shim) — recent huggingface_hub
-REM versions dropped the ``huggingface_hub.commands`` submodule, so the older
-REM ``-m huggingface_hub.commands.huggingface_cli download`` invocation breaks
-REM with ModuleNotFoundError. max_workers=1 also dodges the Windows + py3.10
-REM thread-shutdown race on Ctrl-C.
-"!VENV_PY!" -c "from huggingface_hub import snapshot_download; p = snapshot_download('zizhaotong/SCOPE', max_workers=1); print(p)"
-if errorlevel 1 (
-    echo [download_models] download failed with exit code %errorlevel%
-    exit /b %errorlevel%
+if not exist "!DL_SCRIPT!" (
+    echo [download_models] ERROR: _download_models.py not found at !DL_SCRIPT!
+    exit /b 1
 )
 
-echo [download_models] Done.
-echo Cache path:
-"!VENV_PY!" -c "from huggingface_hub import snapshot_download; print(snapshot_download('zizhaotong/SCOPE', local_files_only=True))"
+echo [download_models] Downloading zizhaotong/SCOPE into !TARGET_DIR! ...
+REM Invoke the .py helper instead of `python -c "..."` to avoid cmd
+REM delayed-expansion / quoting pitfalls on paths with backslashes.
+REM --workers 1 dodges the Windows + py3.10 thread-shutdown race on Ctrl-C.
+"!VENV_PY!" "!DL_SCRIPT!" --local-dir "!TARGET_DIR!" --workers 1
+set "EXIT_CODE=!ERRORLEVEL!"
+if not "!EXIT_CODE!"=="0" (
+    echo [download_models] download failed with exit code !EXIT_CODE!
+    exit /b !EXIT_CODE!
+)
+
+echo [download_models] Done.  Model dir:
+echo   !TARGET_DIR!
 
 endlocal

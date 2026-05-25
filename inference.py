@@ -39,11 +39,12 @@ import argparse
 import glob
 import logging
 import os
+import time
 
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from safetensors.torch import load_file
 
 from diffsynth.models.scope_dit import WanModel as SCOPEDiT
@@ -319,6 +320,113 @@ def init_pipeline(model_dir: str) -> WanVideoPipeline:
 # ============================================================
 
 
+def draw_input_overlay(
+    frame: Image.Image,
+    row: pd.Series,
+    frame_idx: int,
+    total_frames: int,
+) -> Image.Image:
+    """Draws PC-style input overlay (WASD + mouse) on a single frame.
+
+    Mapping from the SCOPE action schema (which is gamepad-flavored) to PC:
+      j_left  (left stick X/Y)  -> WASD movement keys (deadzone 0.3)
+      j_right (right stick X/Y) -> mouse look delta arrow
+      BUTTON_COLS               -> action chips top-left (Fire/Aim/Jump/...)
+    Layout:
+      top-left      action button chips
+      bottom-left   WASD key cluster + frame counter
+      bottom-right  mouse box with crosshair + delta arrow
+    """
+    img = frame.copy() if frame.mode == "RGBA" else frame.convert("RGBA")
+    d = ImageDraw.Draw(img, "RGBA")
+    w, h = img.size
+    pad = 8
+    BTN_LABELS = {
+        "right_trigger": "Fire",
+        "left_trigger":  "Aim",
+        "south":         "Jump",
+        "right_thumb":   "Melee",
+        "west":          "Reload",
+        "north":         "Switch",
+    }
+
+    y = pad
+    for name in BUTTON_COLS:
+        pressed = float(row.get(name, 0.0)) > 0.5
+        label = BTN_LABELS.get(name, name)
+        fg = (60, 220, 60, 240) if pressed else (200, 200, 200, 140)
+        bg = (0, 0, 0, 170) if pressed else (0, 0, 0, 90)
+        d.rectangle([pad, y, pad + 80, y + 16], fill=bg)
+        d.text((pad + 4, y + 1), label, fill=fg)
+        y += 18
+
+    try:
+        lx, ly = float(row["j_left"][0]), float(row["j_left"][1])
+    except (TypeError, IndexError, KeyError):
+        lx, ly = 0.0, 0.0
+    try:
+        rx, ry = float(row["j_right"][0]), float(row["j_right"][1])
+    except (TypeError, IndexError, KeyError):
+        rx, ry = 0.0, 0.0
+    DZ = 0.3
+    wasd = {
+        "W": ly < -DZ,
+        "A": lx < -DZ,
+        "S": ly >  DZ,
+        "D": lx >  DZ,
+    }
+
+    key_sz = 26
+    key_gap = 4
+    row_w = 4 * key_sz + 3 * key_gap
+    row_x = (w - row_w) // 2
+    row_y = h - pad - key_sz - 16
+
+    def draw_key(kx: int, ky: int, label: str, pressed: bool):
+        fill = (60, 180, 60, 230) if pressed else (0, 0, 0, 150)
+        outline = (180, 255, 180, 255) if pressed else (220, 220, 220, 200)
+        d.rectangle([kx, ky, kx + key_sz, ky + key_sz],
+                    fill=fill, outline=outline, width=2)
+        d.text((kx + 8, ky + 6), label,
+               fill=(255, 255, 255, 245) if pressed else (220, 220, 220, 190))
+
+    for i, letter in enumerate("WASD"):
+        kx = row_x + i * (key_sz + key_gap)
+        draw_key(kx, row_y, letter, wasd[letter])
+
+    counter_y = row_y + key_sz + 2
+    d.rectangle([row_x, counter_y, row_x + row_w, counter_y + 12],
+                fill=(0, 0, 0, 150))
+    d.text((row_x + 4, counter_y - 1),
+           f"frame {frame_idx + 1}/{total_frames}",
+           fill=(255, 255, 255, 230))
+
+    box_w = 70
+    box_h = 50
+    box_x = w - pad - box_w
+    box_y = h - pad - box_h - 16
+    d.rectangle([box_x, box_y, box_x + box_w, box_y + box_h],
+                outline=(255, 255, 255, 180), width=2,
+                fill=(0, 0, 0, 110))
+    d.text((box_x + box_w - 38, box_y + box_h + 1), "mouse",
+           fill=(255, 255, 255, 220))
+    cx = box_x + box_w // 2
+    cy = box_y + box_h // 2
+    d.line([cx - 6, cy, cx + 6, cy], fill=(180, 180, 180, 200), width=1)
+    d.line([cx, cy - 6, cx, cy + 6], fill=(180, 180, 180, 200), width=1)
+    mag = (rx * rx + ry * ry) ** 0.5
+    if mag > 0.05:
+        scale_x = (box_w // 2) - 6
+        scale_y = (box_h // 2) - 6
+        tip_x = int(cx + max(-1.0, min(1.0, rx)) * scale_x)
+        tip_y = int(cy + max(-1.0, min(1.0, ry)) * scale_y)
+        d.line([cx, cy, tip_x, tip_y], fill=(255, 80, 80, 240), width=2)
+        d.ellipse([tip_x - 3, tip_y - 3, tip_x + 3, tip_y + 3],
+                  fill=(255, 80, 80, 240))
+
+    return img.convert("RGB")
+
+
 def generate_video(
     pipe: WanVideoPipeline,
     image_path: str,
@@ -344,6 +452,7 @@ def generate_video(
     num_frames = compute_num_frames(args.max_frames)
     keyboard, mouse = load_actions(action_path, num_frames)
 
+    t0 = time.perf_counter()
     video = pipe(
         prompt=args.prompt,
         negative_prompt=NEGATIVE_PROMPT,
@@ -357,10 +466,32 @@ def generate_video(
         keyboard_action=keyboard,
         mouse_action=mouse,
     )
+    gen_s = time.perf_counter() - t0
+    out_fps = 20  # save_video target fps
+    gen_fps = num_frames / gen_s if gen_s > 0 else 0.0
+    rtf = gen_fps / out_fps if out_fps else 0.0
+    logger.info(
+        "[scope] generated %d frames in %.2fs  -  gen %.2f fps  -  %.2fx real-time @ %d fps playback",
+        num_frames, gen_s, gen_fps, rtf, out_fps,
+    )
+
+    if not getattr(args, "no_overlay", False):
+        action_df = pd.read_parquet(action_path)
+        if len(action_df) < num_frames:
+            action_df = pd.concat(
+                [action_df, pd.concat([action_df.iloc[[-1]]] *
+                                       (num_frames - len(action_df)),
+                                       ignore_index=True)],
+                ignore_index=True,
+            )
+        video = [
+            draw_input_overlay(f, action_df.iloc[i], i, num_frames)
+            for i, f in enumerate(video)
+        ]
 
     stem = os.path.splitext(os.path.basename(image_path))[0]
     out_path = os.path.join(args.output_dir, f"{stem}.mp4")
-    save_video(video, out_path, fps=20, quality=5)
+    save_video(video, out_path, fps=out_fps, quality=5)
     return out_path
 
 
@@ -412,6 +543,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--max_frames", type=int, default=81)
+    parser.add_argument("--no_overlay", action="store_true",
+                        help="Disable per-frame keyboard/joystick input overlay drawn on each output frame.")
     parser.add_argument("--num_inference_steps", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
